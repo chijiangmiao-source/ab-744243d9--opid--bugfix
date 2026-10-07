@@ -192,6 +192,70 @@ test('刷新/关闭重开（序列化-恢复）：可见序列、等待项、已
   assert.deepEqual(reopened.visibleIds(), ['root', 'a1', 'a2', 'offline-parent', 'late']);
 });
 
+test('非法首投递同样不可变绑定操作标识：同标识异载荷 => REPLAY_CONFLICT，原始非法载荷重投幂等，恢复后语义一致', () => {
+  const r = new Replica('R1');
+  r.deliver(ins('root', null, 0, '根'));
+  const illegal = ins('x', 'root', 40, '越界标题'); // 序号 40 越界
+  const legal = ins('x', 'root', 1, '合法但不同标题'); // 同标识、合法但载荷不同
+
+  // 首投越界：拒绝并把标识绑定到该（非法）载荷指纹
+  const first = r.deliver(illegal);
+  assert.equal(first.status, 'rejected');
+  assert.equal(first.reason, REJECT.SEQ_OUT_OF_RANGE);
+  assert.equal(r.seen.get('x'), fingerprint(illegal));
+  assert.deepEqual(r.visibleIds(), ['root']);
+
+  // 同标识改用合法但不同内容 => 篡改冲突，不得被应用，可见投影不变
+  const second = r.deliver(legal);
+  assert.equal(second.status, 'rejected');
+  assert.equal(second.reason, REJECT.REPLAY_CONFLICT);
+  assert.deepEqual(r.visibleIds(), ['root']);
+
+  // 同一标识的拒绝记录与已应用结果不得并存
+  assert.ok(!r.applied.has('x'));
+  assert.equal(r.rejected.get('x').reason, REJECT.SEQ_OUT_OF_RANGE);
+  assert.ok([...r.rejected.keys()].some((k) => k.startsWith('x#tampered#')));
+
+  // 原始非法载荷重投：维持首次业务结论（幂等拒绝，不新增记录、不新增步骤）
+  const rejectedBefore = r.rejected.size;
+  const replay = r.deliver(illegal);
+  assert.equal(replay.status, 'rejected');
+  assert.equal(replay.reason, REJECT.SEQ_OUT_OF_RANGE);
+  assert.equal(replay.duplicate, true);
+  assert.equal(r.rejected.size, rejectedBefore);
+  assert.deepEqual(r.visibleIds(), ['root']);
+
+  // 合法载荷无论再投多少次都仍是冲突
+  assert.equal(r.deliver(legal).reason, REJECT.REPLAY_CONFLICT);
+  assert.ok(!r.applied.has('x'));
+
+  // 序列化-恢复后：标识语义与恢复前完全一致
+  const reopened = Replica.restore(JSON.parse(JSON.stringify(r.toJSON())));
+  assert.equal(reopened.seen.get('x'), fingerprint(illegal));
+  assert.deepEqual(reopened.visibleIds(), ['root']);
+  const replayAfterReopen = reopened.deliver(illegal);
+  assert.equal(replayAfterReopen.status, 'rejected');
+  assert.equal(replayAfterReopen.reason, REJECT.SEQ_OUT_OF_RANGE);
+  assert.equal(replayAfterReopen.duplicate, true);
+  // 已被拒的标识不会在恢复后换个载荷就被应用，也不会再报越界
+  assert.equal(reopened.deliver(legal).reason, REJECT.REPLAY_CONFLICT);
+  assert.ok(!reopened.applied.has('x'));
+  assert.equal(reopened.rejected.get('x').reason, REJECT.SEQ_OUT_OF_RANGE);
+  assert.deepEqual(reopened.visibleIds(), ['root']);
+});
+
+test('其它形态级首拒（缺父）同样绑定标识：同标识随后改投合法异载荷仍是 REPLAY_CONFLICT', () => {
+  const r = new Replica('R1');
+  // parent 形态非法 => MISSING_PARENT，标识即被绑定
+  assert.equal(
+    r.deliver({ opId: 'm', type: 'insert', parent: '', seq: 0, title: '缺父' }).reason,
+    REJECT.MISSING_PARENT,
+  );
+  assert.equal(r.deliver(ins('m', null, 0, '改成根插入')).reason, REJECT.REPLAY_CONFLICT);
+  assert.ok(!r.applied.has('m'));
+  assert.deepEqual(r.visibleIds(), []);
+});
+
 test('指纹：同标识同载荷字节一致；任一字段变化即视为篡改', () => {
   const base = ins('a', null, 0, 'A');
   assert.equal(fingerprint(base), fingerprint(ins('a', null, 0, 'A')));

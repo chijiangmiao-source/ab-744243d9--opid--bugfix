@@ -187,3 +187,61 @@ test('reset 后重新整段回放得到相同投影', () => {
   const second = JSON.stringify(d.state().replicas);
   assert.equal(first, second);
 });
+
+test('零散投递：非法首投递绑定标识后，同标识合法异载荷改投为 REPLAY_CONFLICT，重开后语义一致', () => {
+  const sheet = parseSheet(JSON.stringify({
+    replicas: ['R1', 'R2'],
+    steps: [
+      { opId: 'root', type: 'insert', parent: null, seq: 0, title: '根步骤' },
+    ],
+    scripts: {
+      R1: ['root'],
+      R2: ['root'],
+    },
+  }));
+  const d = new Drill('replay-bind', sheet);
+  d.play(Infinity);
+
+  const illegal = { opId: 'x', type: 'insert', parent: 'root', seq: 40, title: '越界' };
+  const legal = { opId: 'x', type: 'insert', parent: 'root', seq: 1, title: '改写后的合法插入' };
+
+  // 通过重开后的零散投递入口首投：序号越界
+  const first = d.deliverExtra('R1', illegal);
+  assert.equal(first.status, 'rejected');
+  assert.equal(first.reason, 'SEQ_OUT_OF_RANGE');
+
+  // 同标识改投合法但不同的载荷：必须是篡改冲突，而不是被应用
+  const second = d.deliverExtra('R1', legal);
+  assert.equal(second.status, 'rejected');
+  assert.equal(second.reason, 'REPLAY_CONFLICT');
+
+  const r1 = d.replicas.get('R1');
+  assert.deepEqual(r1.visibleIds(), ['root']); // 冲突不改变可见步骤
+  assert.ok(!r1.applied.has('x'), '已应用记录中不得出现被拒标识');
+  assert.equal(r1.rejected.get('x').reason, 'SEQ_OUT_OF_RANGE');
+  assert.ok([...r1.rejected.keys()].some((k) => k.startsWith('x#tampered#')));
+  assert.deepEqual(d.state().replicas.R1.visible.map((s) => s.opId), ['root']);
+
+  // 原始非法载荷重投：维持一致的幂等拒绝
+  const replay = d.deliverExtra('R1', illegal);
+  assert.equal(replay.status, 'rejected');
+  assert.equal(replay.reason, 'SEQ_OUT_OF_RANGE');
+  assert.equal(replay.duplicate, true);
+
+  // 序列化恢复后：标识语义与恢复前一致，矛盾的“已应用却越界”状态不得出现
+  const reopened = reopen(d);
+  const rr1 = reopened.replicas.get('R1');
+  assert.deepEqual(rr1.visibleIds(), ['root']);
+  assert.ok(!rr1.applied.has('x'));
+
+  const replayIllegalAfter = reopened.deliverExtra('R1', illegal);
+  assert.equal(replayIllegalAfter.status, 'rejected');
+  assert.equal(replayIllegalAfter.reason, 'SEQ_OUT_OF_RANGE');
+  assert.equal(replayIllegalAfter.duplicate, true);
+
+  const replayLegalAfter = reopened.deliverExtra('R1', legal);
+  assert.equal(replayLegalAfter.status, 'rejected');
+  assert.equal(replayLegalAfter.reason, 'REPLAY_CONFLICT');
+  assert.deepEqual(reopened.replicas.get('R1').visibleIds(), ['root']);
+  assert.ok(!reopened.replicas.get('R1').applied.has('x'));
+});

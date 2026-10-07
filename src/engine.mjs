@@ -132,12 +132,37 @@ export class Replica {
     const norm = normalizeOp(rawOp);
 
     if (norm.error) {
-      const key = norm.opId ?? `__invalid_${++this._invalidCount}__`;
-      // 无有效标识的坏操作：逐个留痕，但不影响任何投影
-      if (!this.rejected.has(key)) {
+      const opId = norm.opId;
+      if (opId === null || opId === undefined) {
+        // 无有效标识的坏操作：逐个留痕，但不影响任何投影
+        const key = `__invalid_${++this._invalidCount}__`;
         this.rejected.set(key, { reason: norm.error, op: rawOp, at: when });
+        return { status: 'rejected', reason: norm.error, opId: null };
       }
-      return { status: 'rejected', reason: norm.error, opId: norm.opId ?? null };
+      // 即便载荷在形态/序号级被拒，稳定标识也必须在首次投递时就与该载荷
+      // 指纹建立不可变关联；否则同标识改投一份不同（甚至合法）的载荷会被
+      // 当作“首次见到”而应用，使同一标识同时具有已拒绝与已应用两种语义。
+      const fp = fingerprint(rawOp);
+      if (this.seen.has(opId)) {
+        if (this.seen.get(opId) === fp) {
+          // 首个拒因载荷的幂等重投：维持首次业务结论，不新增任何记录
+          return {
+            status: 'rejected',
+            reason: this.rejected.get(opId)?.reason ?? norm.error,
+            opId,
+            duplicate: true,
+          };
+        }
+        // 标识已绑定其它载荷字节：篡改冲突，以派生键留痕，原结论不变
+        const tamperKey = `${opId}#tampered#${fp.slice(0, 12)}`;
+        if (!this.rejected.has(tamperKey)) {
+          this.rejected.set(tamperKey, { reason: REJECT.REPLAY_CONFLICT, op: rawOp, at: when });
+        }
+        return { status: 'rejected', reason: REJECT.REPLAY_CONFLICT, opId };
+      }
+      this.seen.set(opId, fp);
+      this.rejected.set(opId, { reason: norm.error, op: rawOp, at: when });
+      return { status: 'rejected', reason: norm.error, opId };
     }
 
     const op = norm.op;
