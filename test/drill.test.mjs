@@ -187,3 +187,68 @@ test('reset 后重新整段回放得到相同投影', () => {
   const second = JSON.stringify(d.state().replicas);
   assert.equal(first, second);
 });
+
+test('零散投递：首次越界被拒即绑定标识，异载荷重放为 REPLAY_CONFLICT，重开前后语义一致', () => {
+  // 仅有根步骤的两副本演练，后续操作全部走重开后的零散投递入口
+  const sheet = parseSheet(JSON.stringify({
+    replicas: ['R1', 'R2'],
+    steps: [
+      { opId: 'root', type: 'insert', parent: null, seq: 0, title: '根' },
+    ],
+    scripts: {
+      R1: ['root'],
+      R2: ['root'],
+    },
+  }));
+  const d = new Drill('bind', sheet);
+  d.play(Infinity);
+
+  const illegal = { opId: 'x', type: 'insert', parent: 'root', seq: 40, title: '越界载荷' };
+  const legalButDifferent = { opId: 'x', type: 'insert', parent: 'root', seq: 1, title: '合法但不同' };
+
+  // 首次：序号越界被拒
+  const first = d.deliverExtra('R1', illegal);
+  assert.equal(first.status, 'rejected');
+  assert.equal(first.reason, 'SEQ_OUT_OF_RANGE');
+
+  // 同一标识改用合法但不同的载荷 => 篡改冲突，不改变投影
+  const conflict = d.deliverExtra('R1', legalButDifferent);
+  assert.equal(conflict.status, 'rejected');
+  assert.equal(conflict.reason, 'REPLAY_CONFLICT');
+  const state = d.state();
+  assert.deepEqual(state.replicas.R1.visible.map((s) => s.opId), ['root']);
+  assert.ok(!state.replicas.R1.applied.includes('x'));
+  assert.ok(state.replicas.R1.rejected.some((r) => r.opId === 'x' && r.reason === 'SEQ_OUT_OF_RANGE'));
+  assert.ok(state.replicas.R1.rejected.some((r) => r.opId.startsWith('x#tampered#')));
+
+  // 原始非法载荷重放 => 一致的幂等拒绝
+  const replay = d.deliverExtra('R1', illegal);
+  assert.equal(replay.status, 'rejected');
+  assert.equal(replay.reason, 'SEQ_OUT_OF_RANGE');
+  assert.equal(replay.duplicate, true);
+
+  // 序列化恢复（模拟刷新/关闭重开）后语义与恢复前一致
+  const reopened = reopen(d);
+  const reopenedState = reopened.state();
+  assert.deepEqual(reopenedState.replicas.R1.visible.map((s) => s.opId), ['root']);
+  assert.ok(!reopenedState.replicas.R1.applied.includes('x'));
+
+  const afterReopenIllegal = reopened.deliverExtra('R1', illegal);
+  assert.equal(afterReopenIllegal.status, 'rejected');
+  assert.equal(afterReopenIllegal.reason, 'SEQ_OUT_OF_RANGE');
+  assert.equal(afterReopenIllegal.duplicate, true);
+
+  const afterReopenConflict = reopened.deliverExtra('R1', legalButDifferent);
+  assert.equal(afterReopenConflict.status, 'rejected');
+  assert.equal(afterReopenConflict.reason, 'REPLAY_CONFLICT');
+
+  const finalState = reopened.state();
+  assert.deepEqual(finalState.replicas.R1.visible.map((s) => s.opId), ['root']);
+  assert.ok(!finalState.replicas.R1.applied.includes('x'), 'x 不得同时已应用又被拒绝');
+  // 拒绝记录中不得出现同标识“已应用 + 被拒绝”并存
+  assert.equal(
+    finalState.replicas.R1.rejected.filter((r) => r.opId === 'x').length,
+    1,
+  );
+});
+

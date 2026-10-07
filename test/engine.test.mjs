@@ -198,3 +198,94 @@ test('指纹：同标识同载荷字节一致；任一字段变化即视为篡�
   assert.notEqual(fingerprint(base), fingerprint(ins('a', null, 1, 'A')));
   assert.notEqual(fingerprint(base), fingerprint(ins('a', 'root', 0, 'A')));
 });
+
+test('首次投递即被拒（序号越界）也把指纹不可变绑定到标识：异载荷重放为 REPLAY_CONFLICT，投影不变', () => {
+  const r = new Replica('R1');
+  r.deliver(ins('root', null, 0, '根'));
+
+  // 1) 首次以 x 投递 seq=40 的非法插入 => SEQ_OUT_OF_RANGE
+  const illegal = { opId: 'x', type: 'insert', parent: 'root', seq: 40, title: '越界载荷' };
+  const first = r.deliver(illegal);
+  assert.equal(first.status, 'rejected');
+  assert.equal(first.reason, REJECT.SEQ_OUT_OF_RANGE);
+  assert.ok(r.seen.has('x'), '首次投递即把指纹绑定到 x');
+  assert.equal(r.rejected.get('x').reason, REJECT.SEQ_OUT_OF_RANGE);
+  assert.ok(!r.applied.has('x'));
+  assert.deepEqual(r.visibleIds(), ['root']);
+
+  // 2) 仍用 x，但改为序号 1、标题不同的合法载荷 => REPLAY_CONFLICT，不得应用
+  const second = { opId: 'x', type: 'insert', parent: 'root', seq: 1, title: '合法但不同的载荷' };
+  const replay = r.deliver(second);
+  assert.equal(replay.status, 'rejected');
+  assert.equal(replay.reason, REJECT.REPLAY_CONFLICT);
+  assert.deepEqual(r.visibleIds(), ['root'], '冲突不改变可见步骤');
+  assert.ok(!r.applied.has('x'), 'x 不得同时出现在已应用记录中');
+  // 原标识的首个拒因保持 SEQ_OUT_OF_RANGE，篡改仅以派生键留痕
+  assert.equal(r.rejected.get('x').reason, REJECT.SEQ_OUT_OF_RANGE);
+  assert.ok(
+    r.rejectionList().some(
+      (rec) => rec.opId.startsWith('x#tampered#') && rec.reason === REJECT.REPLAY_CONFLICT,
+    ),
+    '篡改以派生键留痕，不污染原标识',
+  );
+
+  // 3) 原始非法载荷在同进程内重投 => 一致的拒绝（幂等），不新增拒绝记录
+  const rejectedBefore = r.rejected.size;
+  const replayIllegal = r.deliver(illegal);
+  assert.equal(replayIllegal.status, 'rejected');
+  assert.equal(replayIllegal.reason, REJECT.SEQ_OUT_OF_RANGE);
+  assert.equal(replayIllegal.duplicate, true);
+  assert.equal(r.rejected.size, rejectedBefore, '重放被拒载荷不新增记录');
+  assert.deepEqual(r.visibleIds(), ['root']);
+
+  // 再次投递合法但不同的载荷：仍是 REPLAY_CONFLICT，同一派生键去重不新增记录
+  const replay2 = r.deliver(second);
+  assert.equal(replay2.status, 'rejected');
+  assert.equal(replay2.reason, REJECT.REPLAY_CONFLICT);
+  assert.equal(r.rejected.size, rejectedBefore);
+
+  // 4) 序列化恢复后语义与恢复前完全一致
+  const reopened = Replica.restore(JSON.parse(JSON.stringify(r.toJSON())));
+  assert.deepEqual(reopened.visibleIds(), ['root']);
+  assert.ok(!reopened.applied.has('x'));
+  assert.equal(reopened.seen.get('x'), r.seen.get('x'), '指纹绑定随持久化恢复');
+
+  const afterIllegal = reopened.deliver(illegal);
+  assert.equal(afterIllegal.status, 'rejected');
+  assert.equal(afterIllegal.reason, REJECT.SEQ_OUT_OF_RANGE);
+  assert.equal(afterIllegal.duplicate, true);
+
+  const afterSecond = reopened.deliver(second);
+  assert.equal(afterSecond.status, 'rejected');
+  assert.equal(afterSecond.reason, REJECT.REPLAY_CONFLICT);
+
+  assert.deepEqual(reopened.visibleIds(), ['root'], '恢复后冲突仍不改变可见步骤');
+  assert.ok(!reopened.applied.has('x'), '恢复后 x 不得出现“已应用却又被拒绝”的矛盾');
+  assert.equal(reopened.rejected.get('x').reason, REJECT.SEQ_OUT_OF_RANGE);
+});
+
+test('首次以非法形态被拒后，同标识的合法载荷也算篡改；同载荷重放幂等，且不与已应用记录并存', () => {
+  const r = new Replica('R1');
+  // delete 缺少 target：形态级 TARGET_MISSING
+  const bad = { opId: 'd', type: 'delete' };
+  assert.equal(r.deliver(bad).reason, REJECT.TARGET_MISSING);
+  assert.ok(r.seen.has('d'));
+
+  // 同标识补成合法 delete => 篡改冲突，而非应用
+  const fixed = { opId: 'd', type: 'delete', target: 'x' };
+  assert.equal(r.deliver(fixed).reason, REJECT.REPLAY_CONFLICT);
+  assert.ok(!r.applied.has('d'));
+
+  // 原始坏载荷重放 => 同一拒因的幂等拒绝
+  const again = r.deliver(bad);
+  assert.equal(again.status, 'rejected');
+  assert.equal(again.reason, REJECT.TARGET_MISSING);
+  assert.equal(again.duplicate, true);
+
+  // 恢复后一致
+  const reopened = Replica.restore(JSON.parse(JSON.stringify(r.toJSON())));
+  assert.equal(reopened.deliver(fixed).reason, REJECT.REPLAY_CONFLICT);
+  assert.equal(reopened.deliver(bad).reason, REJECT.TARGET_MISSING);
+  assert.ok(!reopened.applied.has('d'));
+});
+

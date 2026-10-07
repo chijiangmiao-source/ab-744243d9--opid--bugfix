@@ -43,7 +43,9 @@ function validId(v) {
   return typeof v === 'string' && ID_RE.test(v);
 }
 
-// 规范化后的操作指纹：同一稳定标识 + 同一规范字节 => 重复投递；字节不同 => 篡改
+// 规范化后的操作指纹：同一稳定标识 + 同一规范字节 => 重复投递；字节不同 => 篡改。
+// 对形态非法但带有有效标识与已知类型的原始操作同样可派生（字段可能缺失，
+// JSON 中缺省键与显式 null 可区分），使“首次投递即被拒”的载荷也能与标识绑定。
 export function canonicalOp(op) {
   if (op.type === 'delete') {
     return JSON.stringify({
@@ -52,13 +54,17 @@ export function canonicalOp(op) {
       target: op.target,
     });
   }
-  return JSON.stringify({
-    opId: op.opId,
-    type: 'insert',
-    parent: op.parent,
-    seq: op.seq,
-    title: op.title,
-  });
+  if (op.type === 'insert') {
+    return JSON.stringify({
+      opId: op.opId,
+      type: 'insert',
+      parent: op.parent,
+      seq: op.seq,
+      title: op.title,
+    });
+  }
+  // 类型无法识别的畸形操作：以稳定标识与原始类型值留痕，仍可与重放/篡改区分
+  return JSON.stringify({ opId: op.opId, type: op.type ?? null });
 }
 
 export function fingerprint(op) {
@@ -131,9 +137,47 @@ export class Replica {
     const when = at ?? this.deliveryCount;
     const norm = normalizeOp(rawOp);
 
+    // 稳定操作标识的不可变绑定先于一切业务结论：
+    // 只要本次载荷携带有效标识，就在处理形态/上下文校验之前解析重放关系，
+    // 使“首次投递即被拒（如序号越界）”的载荷同样把指纹绑定到该标识。
+    //  - 已绑定且同指纹 => 幂等重放：重复投递 / 重放此前的等待或拒绝结论；
+    //  - 已绑定但异指纹 => REPLAY_CONFLICT（派生键留痕，不触碰原标识投影）；
+    //  - 首次出现 => 立刻绑定指纹，再继续后续判定。
+    if (norm.opId || norm.op) {
+      const seenId = norm.opId ?? norm.op.opId;
+      const fp = fingerprint(norm.op ?? rawOp);
+      if (this.seen.has(seenId)) {
+        if (this.seen.get(seenId) === fp) {
+          if (this.waiting.has(seenId)) return { status: 'waiting', opId: seenId, duplicate: true };
+          if (this.rejected.has(seenId)) {
+            return {
+              status: 'rejected',
+              reason: this.rejected.get(seenId).reason,
+              opId: seenId,
+              duplicate: true,
+            };
+          }
+          return { status: 'duplicate', opId: seenId };
+        }
+        const tamperKey = `${seenId}#tampered#${fp.slice(0, 12)}`;
+        if (!this.rejected.has(tamperKey)) {
+          this.rejected.set(tamperKey, {
+            reason: REJECT.REPLAY_CONFLICT,
+            op: norm.op ?? rawOp,
+            at: when,
+          });
+        }
+        return { status: 'rejected', reason: REJECT.REPLAY_CONFLICT, opId: seenId };
+      }
+      // 首次见到该标识：无论后续结论是拒绝、等待还是应用，绑定即刻生效且不可变
+      this.seen.set(seenId, fp);
+    }
+
     if (norm.error) {
       const key = norm.opId ?? `__invalid_${++this._invalidCount}__`;
-      // 无有效标识的坏操作：逐个留痕，但不影响任何投影
+      // 无有效标识的坏操作：逐个留痕，但不影响任何投影；
+      // 有有效标识的坏操作：上面已完成指纹绑定，拒绝记录以原标识留痕，
+      // 同载荷重放幂等、异载荷重放按篡改处理。
       if (!this.rejected.has(key)) {
         this.rejected.set(key, { reason: norm.error, op: rawOp, at: when });
       }
@@ -141,46 +185,22 @@ export class Replica {
     }
 
     const op = norm.op;
-    const { opId } = op;
-    const fp = fingerprint(op);
-
-    if (this.seen.has(opId)) {
-      // 复用操作标识：
-      //  - 同指纹 => 幂等重复，不新增步骤/墓碑，等待项也不重复入队
-      //  - 异指纹 => 载荷篡改；以派生键留痕并定位拒因，
-      //    不触碰原标识的 seen/applied/waiting，既有投影保持不变
-      if (this.seen.get(opId) === fp) {
-        if (this.waiting.has(opId)) return { status: 'waiting', opId, duplicate: true };
-        if (this.rejected.has(opId)) {
-          return { status: 'rejected', reason: this.rejected.get(opId).reason, opId, duplicate: true };
-        }
-        return { status: 'duplicate', opId };
-      }
-      const tamperKey = `${opId}#tampered#${fp.slice(0, 12)}`;
-      if (!this.rejected.has(tamperKey)) {
-        this.rejected.set(tamperKey, { reason: REJECT.REPLAY_CONFLICT, op, at: when });
-      }
-      return { status: 'rejected', reason: REJECT.REPLAY_CONFLICT, opId };
-    }
-
-    // 首次见到该标识，记录指纹
-    this.seen.set(opId, fp);
 
     const contextual = this._contextualError(op);
     if (contextual === 'wait') {
-      this.waiting.set(opId, op);
+      this.waiting.set(op.opId, op);
       this._fixpoint();
-      return { status: this.waiting.has(opId) ? 'waiting' : this._statusOf(opId), opId };
+      return { status: this.waiting.has(op.opId) ? 'waiting' : this._statusOf(op.opId), opId: op.opId };
     }
     if (contextual) {
-      this.rejected.set(opId, { reason: contextual, op, at: when });
+      this.rejected.set(op.opId, { reason: contextual, op, at: when });
       this._fixpoint();
-      return { status: 'rejected', reason: contextual, opId };
+      return { status: 'rejected', reason: contextual, opId: op.opId };
     }
 
     this._apply(op, when);
     this._fixpoint();
-    return { status: this._statusOf(opId), opId };
+    return { status: this._statusOf(op.opId), opId: op.opId };
   }
 
   _statusOf(opId) {

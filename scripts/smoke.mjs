@@ -163,6 +163,66 @@ async function main() {
     // 重复投递未新增：可见始终只有 p,x,y,c
   }
 
+  // 3b) 非法首投递的操作标识不得被后续异载荷顶替（零散投递入口 /deliver）
+  const bindSheet = {
+    replicas: ['R1', 'R2'],
+    steps: [{ opId: 'root', type: 'insert', parent: null, seq: 0, title: '根' }],
+    scripts: { R1: ['root'], R2: ['root'] },
+  };
+  const bindIllegal = { opId: 'x', type: 'insert', parent: 'root', seq: 40, title: '越界载荷' };
+  const bindOther = { opId: 'x', type: 'insert', parent: 'root', seq: 1, title: '合法但不同' };
+  let bindId;
+  {
+    const res = await fetch(`${base}/api/drills`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sheet: JSON.stringify(bindSheet) }),
+    });
+    assert(res.status === 201, 'POST /api/drills 创建标识绑定回归演练 201');
+    bindId = (await res.json()).id;
+    const played = await fetch(`${base}/api/drills/${bindId}/play`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ steps: 'all' }),
+    });
+    const playedState = (await played.json()).state;
+    assert(JSON.stringify(playedState.replicas.R1.visible.map((s) => s.opId)) === JSON.stringify(['root']),
+      '标识绑定回归演练先回放根步骤 root');
+  }
+  async function deliverBind(baseUrl, op) {
+    const res = await fetch(`${baseUrl}/api/drills/${bindId}/deliver`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ replica: 'R1', op }),
+    });
+    return res.json();
+  }
+  {
+    const { event, state } = await deliverBind(base, bindIllegal);
+    assert(event.status === 'rejected' && event.reason === 'SEQ_OUT_OF_RANGE',
+      '首次越界插入被拒 SEQ_OUT_OF_RANGE');
+    assert(JSON.stringify(state.replicas.R1.visible.map((s) => s.opId)) === JSON.stringify(['root']),
+      '越界拒绝不改变可见步骤');
+  }
+  {
+    const { event, state } = await deliverBind(base, bindOther);
+    assert(event.status === 'rejected' && event.reason === 'REPLAY_CONFLICT',
+      '同一标识改用合法但不同载荷 => REPLAY_CONFLICT');
+    const snap = state.replicas.R1;
+    assert(JSON.stringify(snap.visible.map((s) => s.opId)) === JSON.stringify(['root']),
+      '冲突不改变可见步骤（仍只有 root）');
+    assert(!snap.applied.includes('x'), 'x 不得进入已应用记录');
+    assert(snap.rejected.some((r) => r.opId === 'x' && r.reason === 'SEQ_OUT_OF_RANGE'),
+      '原标识首个拒因保留为 SEQ_OUT_OF_RANGE');
+    assert(snap.rejected.some((r) => String(r.opId).startsWith('x#tampered#')),
+      '篡改仅以派生键留痕，不污染原标识');
+  }
+  {
+    const { event } = await deliverBind(base, bindIllegal);
+    assert(event.status === 'rejected' && event.reason === 'SEQ_OUT_OF_RANGE' && event.duplicate === true,
+      '原始非法载荷重放保持一致的幂等拒绝');
+  }
+
   // 4) 重启恢复 + 补投滞留合法操作
   if (!EXTERNAL_BASE) {
     const restartedBase = await restartServer(base);
@@ -188,6 +248,25 @@ async function main() {
       assert(JSON.stringify(ids) === JSON.stringify(['p', 'x', 'y', 'c', 'ghost', 'late-child']),
         `重开补投后 ${rid} 滞留子项被链式应用且仅一次`);
     }
+
+    // 标识绑定回归：恢复后语义与恢复前一致，不得出现“已应用又被拒绝”
+    {
+      const { event, state } = await deliverBind(restartedBase, bindIllegal);
+      assert(event.status === 'rejected'
+        && event.reason === 'SEQ_OUT_OF_RANGE'
+        && event.duplicate === true,
+        '重启后重投原始被拒载荷保持 SEQ_OUT_OF_RANGE（幂等拒绝）');
+      assert(JSON.stringify(state.replicas.R1.visible.map((s) => s.opId)) === JSON.stringify(['root']),
+        '重启后冲突不改变可见步骤（仍只有 root）');
+    }
+    {
+      const { event, state } = await deliverBind(restartedBase, bindOther);
+      assert(event.status === 'rejected' && event.reason === 'REPLAY_CONFLICT',
+        '重启后同标识异载荷重放仍为 REPLAY_CONFLICT');
+      assert(!state.replicas.R1.applied.includes('x'),
+        '重启后 x 不得同时呈现已应用与被拒绝的矛盾语义');
+    }
+
     const finalRes = await fetch(`${restartedBase}/api/drills/${drillId}`);
     const finalState = await finalRes.json();
     assert(finalState.converged === true, '补投后两副本再次收敛');
