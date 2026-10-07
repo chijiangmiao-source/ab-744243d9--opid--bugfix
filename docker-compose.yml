@@ -1,0 +1,55 @@
+# 姿控步骤单演练台
+# 宿主机访问端口可通过环境变量配置： HOST_PORT=9090 docker compose up web
+services:
+  web:
+    build:
+      context: .
+    image: attitude-control-drill:latest
+    environment:
+      PORT: "8080"
+      HOST: "0.0.0.0"
+      DATA_DIR: /data
+    ports:
+      # 宿主机端口可配置（默认 8080）；容器内固定 8080
+      - "${HOST_PORT:-8080}:8080"
+    volumes:
+      - drill-data:/data
+    healthcheck:
+      test: ["CMD", "node", "-e",
+        "fetch('http://127.0.0.1:8080/healthz').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 3s
+    restart: unless-stopped
+
+  # 验收服务（一次性）：
+  #   并发插入收敛、祖先撤销后的迟到合法子项、重开恢复
+  # 流程：构建页面 -> 代码测试 -> 本地端到端冒烟（含进程重启恢复）
+  #       -> 对 compose 中 web 的页面与 /healthz 做 HTTP 冒烟
+  # 退出码即验收结果（非 0 表示失败）。运行： docker compose up --build verify
+  verify:
+    image: attitude-control-drill:latest
+    build:
+      context: .
+    depends_on:
+      web:
+        condition: service_healthy
+    environment:
+      BASE_URL: http://web:8080
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        echo "== [1/4] 构建页面 =="
+        npm run build
+        echo "== [2/4] 代码测试（并发插入 / 祖先撤销后迟到子项 / 重开恢复） =="
+        npm test
+        echo "== [3/4] 本地端到端冒烟（含关闭-重开恢复） =="
+        node scripts/smoke.mjs
+        echo "== [4/4] 对 web 页面与健康接口做 HTTP 冒烟 =="
+        BASE_URL=$$BASE_URL node scripts/smoke.mjs
+        echo "== verify 通过 =="
+
+volumes:
+  drill-data:

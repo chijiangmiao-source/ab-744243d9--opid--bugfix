@@ -1,0 +1,17 @@
+{
+  "name": "attitude-control-sheet-drill",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "姿控步骤单多副本离线并发演练台：乱序等待、墓碑、首个拒因定位、收敛与重开恢复",
+  "scripts": {
+    "start": "node src/server.mjs",
+    "build": "node scripts/build.mjs",
+    "test": "node --test test/*.test.mjs",
+    "smoke": "node scripts/smoke.mjs",
+    "verify": "npm run build && npm test && node scripts/smoke.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

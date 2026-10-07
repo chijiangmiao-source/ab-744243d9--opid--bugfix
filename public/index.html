@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>姿控步骤单演练 · 副本回放台</title>
+  <link rel="stylesheet" href="/app.css" />
+</head>
+<body>
+  <header class="topbar">
+    <h1>姿控步骤单演练 <span class="sub">副本回放台</span></h1>
+    <span id="health" class="health" title="来自 /healthz">健康检查：…</span>
+  </header>
+
+  <main class="layout">
+    <section class="panel input-panel">
+      <h2>1. 粘贴步骤单</h2>
+      <p class="hint">
+        2~4 个副本，每副本最多 40 个生成/投递动作；同一 tick 内各副本并发投递。
+        <code>scripts</code> 中重复引用即重复投递，内联对象可注入故障（篡改载荷 / 缺失父项 / 越界序号）。
+      </p>
+      <textarea id="sheet" spellcheck="false"></textarea>
+
+      <div class="btn-row">
+        <button id="btn-create" class="primary">新建演练</button>
+        <button id="btn-step" disabled>单步回放</button>
+        <button id="btn-all" disabled>整段回放</button>
+        <button id="btn-reset" disabled>重置</button>
+        <button id="btn-seal" class="warn" disabled>封存演练</button>
+        <button id="btn-sample">载入示例</button>
+      </div>
+      <div id="sheet-error" class="error-box" hidden></div>
+
+      <h2>2. 重开后零散投递</h2>
+      <p class="hint">刷新/关闭重开后，仍可向指定副本继续投递此前滞留的合法操作。</p>
+      <div class="deliver-row">
+        <select id="extra-replica"></select>
+        <input id="extra-op" type="text" spellcheck="false"
+          value='{"opId":"late-1","type":"insert","parent":"a","seq":9,"title":"重开后补录"}' />
+        <button id="btn-deliver" disabled>投递</button>
+      </div>
+    </section>
+
+    <section class="panel stage-panel">
+      <div class="stage-head">
+        <h2>3. 回放舞台</h2>
+        <div id="stage-meta" class="meta">尚未创建演练</div>
+      </div>
+      <div id="replicas" class="replicas"></div>
+
+      <h2>操作日志</h2>
+      <div class="table-wrap">
+        <table id="log-table">
+          <thead>
+            <tr><th>tick</th><th>副本</th><th>动作</th><th>结果</th><th>首个拒因</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>
